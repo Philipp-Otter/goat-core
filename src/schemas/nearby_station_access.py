@@ -1,17 +1,18 @@
 from typing import List
+from uuid import UUID
+
 from pydantic import BaseModel, Field
-from src.schemas.colors import ColorRangeType
+
+from src.schemas.catchment_area import (
+    CatchmentAreaRoutingModeActiveMobility,
+    CatchmentAreaRoutingModePT,
+)
 from src.schemas.layer import ToolType
 from src.schemas.toolbox_base import (
     CatchmentAreaStartingPointsBase,
     PTTimeWindow,
     check_starting_points,
     input_layer_type_point,
-    DefaultResultLayerName,
-)
-from src.schemas.catchment_area import (
-    CatchmentAreaRoutingModeActiveMobility,
-    CatchmentAreaRoutingModePT,
 )
 
 
@@ -57,6 +58,11 @@ class INearbyStationAccess(BaseModel):
         ...,
         title="Time Window",
         description="The time window of the catchment area.",
+    )
+    scenario_id: UUID | None = Field(
+        None,
+        title="Scenario ID",
+        description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
 
     @property

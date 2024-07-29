@@ -1,22 +1,21 @@
 from enum import Enum
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, validator
 
-from src.schemas.layer import ToolType
 from src.schemas.colors import ColorRangeType
-
-from typing import List, Optional
+from src.schemas.layer import ToolType
 from src.schemas.toolbox_base import (
     CatchmentAreaStartingPointsBase,
-    PTTimeWindow,
-    input_layer_type_point,
-    check_starting_points,
     DefaultResultLayerName,
+    PTTimeWindow,
+    check_starting_points,
+    input_layer_type_point,
 )
 
-
 """Catchment area starting point validators."""
+
 
 class CatchmentAreaStartingPointsActiveMobility(CatchmentAreaStartingPointsBase):
     """Model for the active mobility catchment area starting points."""
@@ -33,6 +32,7 @@ class CatchmentAreaStartingPointsMotorizedMobility(CatchmentAreaStartingPointsBa
 
 
 """Catchment area routing mode schemas."""
+
 
 class CatchmentAreaRoutingModeActiveMobility(str, Enum):
     """Routing active mobility type schema."""
@@ -57,6 +57,7 @@ class CatchmentAreaRoutingModePT(str, Enum):
 
 class CatchmentAreaRoutingEgressModePT(str, Enum):
     """Routing public transport egress mode schema."""
+
     walk = "walk"
     bicycle = "bicycle"
 
@@ -96,6 +97,7 @@ class CatchmentAreaRoutingModeCar(str, Enum):
 
 
 """Catchment area travel cost schemas."""
+
 
 class CatchmentAreaTravelTimeCostActiveMobility(BaseModel):
     """Travel time cost schema."""
@@ -203,6 +205,7 @@ class CatchmentAreaTravelDistanceCostMotorizedMobility(BaseModel):
 
 """Catchment area decay function schemas."""
 
+
 class CatchmentAreaDecayFunctionTypePT(Enum):
     LOGISTIC = "logistic"
     LINEAR = "linear"
@@ -221,6 +224,7 @@ class CatchmentAreaDecayFunctionPT(BaseModel):
 
 
 """Catchment area type schemas."""
+
 
 class CatchmentAreaTypeActiveMobility(str, Enum):
     """Catchment area type schema for active mobility."""
@@ -247,6 +251,7 @@ class CatchmentAreaTypeCar(str, Enum):
 
 """User-configured catchment area payload schemas."""
 
+
 class ICatchmentAreaActiveMobility(BaseModel):
     """Model for the active mobility catchment area"""
 
@@ -271,7 +276,7 @@ class ICatchmentAreaActiveMobility(BaseModel):
     scenario_id: UUID | None = Field(
         None,
         title="Scenario ID",
-        description="The ID of the scenario that is used for the routing.",
+        description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
     catchment_area_type: CatchmentAreaTypeActiveMobility = Field(
         ...,
@@ -288,7 +293,8 @@ class ICatchmentAreaActiveMobility(BaseModel):
     @validator("polygon_difference", pre=True, always=True)
     def check_polygon_difference(cls, v, values):
         if (
-            values["catchment_area_type"] == CatchmentAreaTypeActiveMobility.polygon.value
+            values["catchment_area_type"]
+            == CatchmentAreaTypeActiveMobility.polygon.value
             and v is None
         ):
             raise ValueError(
@@ -300,7 +306,8 @@ class ICatchmentAreaActiveMobility(BaseModel):
     @validator("polygon_difference", pre=True, always=True)
     def check_polygon_difference_not_specified(cls, v, values):
         if (
-            values["catchment_area_type"] != CatchmentAreaTypeActiveMobility.polygon.value
+            values["catchment_area_type"]
+            != CatchmentAreaTypeActiveMobility.polygon.value
             and v is not None
         ):
             raise ValueError(
@@ -314,7 +321,9 @@ class ICatchmentAreaActiveMobility(BaseModel):
 
     @property
     def geofence_table(self):
-        mode = ToolType.catchment_area_active_mobility.value.replace("catchment_area_", "")
+        mode = ToolType.catchment_area_active_mobility.value.replace(
+            "catchment_area_", ""
+        )
         return f"basic.geofence_{mode}"
 
     @property
@@ -360,17 +369,20 @@ class ICatchmentAreaPT(BaseModel):
         title="Return Type",
         description="The return type of the catchment area.",
     )
-
     polygon_difference: bool | None = Field(
         None,
         title="Polygon Difference",
         description="If true, the polygons returned will be the geometrical difference of two following calculations.",
     )
-
     decay_function: CatchmentAreaDecayFunctionPT = Field(
         CatchmentAreaDecayFunctionPT(),
         title="Decay Function",
         description="The decay function of the catchment area.",
+    )
+    scenario_id: UUID | None = Field(
+        None,
+        title="Scenario ID",
+        description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
 
     # Defaults - not currently user configurable
@@ -456,7 +468,7 @@ class ICatchmentAreaCar(BaseModel):
     scenario_id: UUID | None = Field(
         None,
         title="Scenario ID",
-        description="The ID of the scenario that is used for the routing.",
+        description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
     catchment_area_type: CatchmentAreaTypeCar = Field(
         ...,
@@ -499,7 +511,9 @@ class ICatchmentAreaCar(BaseModel):
 
     @property
     def geofence_table(self):
-        mode = ToolType.catchment_area_active_mobility.value.replace("catchment_area_", "")
+        mode = ToolType.catchment_area_active_mobility.value.replace(
+            "catchment_area_", ""
+        )
         return f"basic.geofence_{mode}"
 
     @property
@@ -541,7 +555,7 @@ class CatchmentAreaNearbyStationAccess(BaseModel):
     scenario_id: UUID | None = Field(
         None,
         title="Scenario ID",
-        description="The ID of the scenario that is used for the routing.",
+        description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
     catchment_area_type: CatchmentAreaTypeActiveMobility = Field(
         ...,
@@ -558,7 +572,8 @@ class CatchmentAreaNearbyStationAccess(BaseModel):
     @validator("polygon_difference", pre=True, always=True)
     def check_polygon_difference(cls, v, values):
         if (
-            values["catchment_area_type"] == CatchmentAreaTypeActiveMobility.polygon.value
+            values["catchment_area_type"]
+            == CatchmentAreaTypeActiveMobility.polygon.value
             and v is None
         ):
             raise ValueError(
@@ -570,7 +585,8 @@ class CatchmentAreaNearbyStationAccess(BaseModel):
     @validator("polygon_difference", pre=True, always=True)
     def check_polygon_difference_not_specified(cls, v, values):
         if (
-            values["catchment_area_type"] != CatchmentAreaTypeActiveMobility.polygon.value
+            values["catchment_area_type"]
+            != CatchmentAreaTypeActiveMobility.polygon.value
             and v is not None
         ):
             raise ValueError(
