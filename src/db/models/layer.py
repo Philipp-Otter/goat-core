@@ -25,9 +25,10 @@ from src.core.config import settings
 from src.db.models._base_class import ContentBaseAttributes, DateTimeBase
 
 if TYPE_CHECKING:
-    from ._link_model import LayerProjectLink
-    from .data_store import DataStore
     from src.db.models.folder import Folder
+
+    from ._link_model import LayerOrganizationLink, LayerProjectLink, LayerTeamLink
+    from .data_store import DataStore
 
 
 class ToolType(str, Enum):
@@ -117,7 +118,7 @@ class FeatureServeType(str, Enum):
     binary = "binary"
 
 
-class ExternalImageryDataType(str, Enum):
+class RasterDataType(str, Enum):
     """Imagery layer data types."""
 
     wms = "wms"
@@ -129,15 +130,16 @@ class LayerType(str, Enum):
     """Layer types that are supported."""
 
     feature = "feature"
-    external_imagery = "external_imagery"
-    external_vector_tile = "external_vector_tile"
+    raster = "raster"
     table = "table"
 
 
-class ExternalVectorTileDataType(str, Enum):
-    """VectorTile layer data types."""
+class FeatureDataType(str, Enum):
+    """Data types for feature layers."""
 
     mvt = "mvt"
+    wfs = "wfs"
+    # NULL / None is used for feature layers not fetched from an external service
 
 
 class FeatureGeometryType(str, Enum):
@@ -351,7 +353,7 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
     """Layer model."""
 
     __tablename__ = "layer"
-    __table_args__ = {"schema": "customer"}
+    __table_args__ = {"schema": settings.CUSTOMER_SCHEMA}
 
     id: UUID | None = Field(
         sa_column=Column(
@@ -365,7 +367,7 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
     user_id: UUID = Field(
         sa_column=Column(
             UUID_PG(as_uuid=True),
-            ForeignKey("customer.user.id", ondelete="CASCADE"),
+            ForeignKey(f"{settings.ACCOUNTS_SCHEMA}.user.id", ondelete="CASCADE"),
             nullable=False,
         ),
         description="Layer owner ID",
@@ -373,7 +375,7 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
     folder_id: UUID = Field(
         sa_column=Column(
             UUID_PG(as_uuid=True),
-            ForeignKey("customer.folder.id", ondelete="CASCADE"),
+            ForeignKey(f"{settings.CUSTOMER_SCHEMA}.folder.id", ondelete="CASCADE"),
             nullable=False,
         ),
         description="Layer folder ID",
@@ -382,7 +384,10 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
         sa_column=Column(Text, nullable=False), description="Layer type"
     )
     data_store_id: UUID | None = Field(
-        sa_column=Column(UUID_PG(as_uuid=True), ForeignKey("customer.data_store.id")),
+        sa_column=Column(
+            UUID_PG(as_uuid=True),
+            ForeignKey(f"{settings.CUSTOMER_SCHEMA}.data_store.id"),
+        ),
         description="Data store ID of the layer",
     )
     extent: str | None = Field(
@@ -402,13 +407,11 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
     )
     url: HttpUrl | None = Field(
         sa_column=Column(Text, nullable=True),
-        description="Layer URL for tile and imagery layers",
+        description="Layer URL for vector and imagery layers",
     )
-    data_type: Optional[
-        Union["ExternalImageryDataType", "ExternalVectorTileDataType"]
-    ] = Field(
+    data_type: Optional[Union["RasterDataType", "FeatureDataType"]] = Field(
         sa_column=Column(Text, nullable=True),
-        description="Data type for imagery layers and tile layers",
+        description="Data type to store the source of the layer",
     )
     tool_type: Optional[ToolType] = Field(
         sa_column=Column(Text, nullable=True),
@@ -444,8 +447,16 @@ class Layer(LayerBase, GeospatialAttributes, DateTimeBase, table=True):
 
     # Relationships
     data_store: "DataStore" = Relationship(back_populates="layers")
-    layer_projects: List["LayerProjectLink"] = Relationship(back_populates="layer", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
+    layer_projects: List["LayerProjectLink"] = Relationship(
+        back_populates="layer", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
     folder: "Folder" = Relationship(back_populates="layers")
+    organization_links: List["LayerOrganizationLink"] = Relationship(
+        back_populates="layer", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+    team_links: List["LayerTeamLink"] = Relationship(
+        back_populates="layer", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
 
     @validator("extent", pre=True)
     def wkt_to_geojson(cls, v):

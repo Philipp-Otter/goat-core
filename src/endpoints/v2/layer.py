@@ -27,10 +27,9 @@ from src.core.config import settings
 # Local application imports
 from src.core.content import (
     read_content_by_id,
-    read_contents_by_ids,
 )
 from src.crud.crud_job import job as crud_job
-from src.crud.crud_layer import CRUDLayerExport, CRUDLayerImport
+from src.crud.crud_layer import CRUDLayerDatasetUpdate, CRUDLayerExport, CRUDLayerImport
 from src.crud.crud_layer import layer as crud_layer
 from src.crud.crud_layer_project import layer_project as crud_layer_project
 from src.db.models.layer import (
@@ -41,22 +40,25 @@ from src.db.models.layer import (
     TableUploadType,
 )
 from src.db.session import AsyncSession
+from src.deps.auth import auth_z
 from src.endpoints.deps import get_db, get_user_id
-from src.schemas.common import ContentIdList, OrderEnum
+from src.schemas.common import OrderEnum
 from src.schemas.error import HTTPErrorHandler
 from src.schemas.job import JobType
 from src.schemas.layer import (
     AreaStatisticsOperation,
     ComputeBreakOperation,
     ICatalogLayerGet,
+    IFileUploadExternalService,
     IFileUploadMetadata,
-    IInternalLayerCreate,
-    IInternalLayerExport,
-    ILayerExternalCreate,
+    ILayerExport,
+    ILayerFromDatasetCreate,
     ILayerGet,
     ILayerRead,
     IMetadataAggregate,
     IMetadataAggregateRead,
+    IRasterCreate,
+    IRasterRead,
     IUniqueValue,
     MaxFileSizeType,
 )
@@ -73,6 +75,7 @@ router = APIRouter()
     summary="Upload file to server and validate",
     response_model=IFileUploadMetadata,
     status_code=201,
+    dependencies=[Depends(auth_z)],
 )
 async def file_upload(
     *,
@@ -108,37 +111,52 @@ async def file_upload(
     # Run the validation
     metadata = await crud_layer.upload_file(
         async_session=async_session,
-        layer_type=layer_type,
         user_id=user_id,
-        file=file,
+        source=file,
+        layer_type=layer_type,
     )
     return metadata
 
 
 @router.post(
-    "/internal",
-    summary="Create a new internal layer",
-    response_class=JSONResponse,
+    "/file-upload-external-service",
+    summary="Fetch data from external service into a file, upload file to server and validate",
+    response_model=IFileUploadMetadata,
     status_code=201,
-    description="Generate a new layer from a file that was previously uploaded using the file-upload endpoint.",
+    dependencies=[Depends(auth_z)],
 )
-async def create_layer_internal(
-    background_tasks: BackgroundTasks,
+async def file_upload_external_service(
+    *,
     async_session: AsyncSession = Depends(get_db),
     user_id: UUID = Depends(get_user_id),
-    project_id: Optional[UUID] = Query(
-        None,
-        description="The ID of the project to add the layer to",
-        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
-    ),
-    layer_in: IInternalLayerCreate = Body(
+    external_service: IFileUploadExternalService = Body(
         ...,
-        examples=layer_request_examples["create_internal"],
-        description="Layer to create",
+        description="External service to fetch data from.",
     ),
 ):
+    """
+    Fetch data from external service into a file, upload file to server and validate.
+    """
+
+    # This endpoint only supports external services providing feature data
+    layer_type = LayerType.feature
+
+    # Run the validation
+    metadata = await crud_layer.upload_file(
+        async_session=async_session,
+        user_id=user_id,
+        source=external_service,
+        layer_type=layer_type,
+    )
+    return metadata
+
+
+def _validate_and_fetch_metadata(
+    user_id: UUID,
+    dataset_id: UUID,
+):
     # Check if user owns folder by checking if it exists
-    folder_path = os.path.join(settings.DATA_DIR, user_id, str(layer_in.dataset_id))
+    folder_path = os.path.join(settings.DATA_DIR, user_id, str(dataset_id))
     if os.path.exists(folder_path) is False:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -147,9 +165,9 @@ async def create_layer_internal(
 
     # Get metadata from file in folder
     metadata_path = None
-    for root, dirs, files in os.walk(folder_path):
-        if 'metadata.json' in files:
-            metadata_path = os.path.join(root, 'metadata.json')
+    for root, _dirs, files in os.walk(folder_path):
+        if "metadata.json" in files:
+            metadata_path = os.path.join(root, "metadata.json")
 
     if metadata_path is None:
         raise HTTPException(
@@ -159,6 +177,32 @@ async def create_layer_internal(
 
     with open(os.path.join(metadata_path)) as f:
         file_metadata = json.loads(json.load(f))
+
+    return file_metadata
+
+
+async def _create_layer_from_dataset(
+    background_tasks: BackgroundTasks,
+    async_session: AsyncSession,
+    user_id: UUID,
+    project_id: Optional[UUID] = Query(
+        None,
+        description="The ID of the project to add the layer to",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    ),
+    layer_in: ILayerFromDatasetCreate = Body(
+        ...,
+        examples=layer_request_examples["create"],
+        description="Layer to create",
+    ),
+):
+    """Create a feature standard or table layer from a dataset."""
+
+    # Validate and fetch dataset file metadata
+    file_metadata = _validate_and_fetch_metadata(
+        user_id=user_id,
+        dataset_id=layer_in.dataset_id,
+    )
 
     # Create job and check if user can create a new job
     job = await crud_job.check_and_create(
@@ -174,7 +218,7 @@ async def create_layer_internal(
         async_session=async_session,
         user_id=user_id,
         job_id=job.id,
-    ).import_file(
+    ).import_file_job(
         file_metadata=file_metadata,
         layer_in=layer_in,
         project_id=project_id,
@@ -183,11 +227,104 @@ async def create_layer_internal(
 
 
 @router.post(
-    "/internal/{layer_id}/export",
+    "/feature-standard",
+    summary="Create a new feature standard layer",
+    response_class=JSONResponse,
+    status_code=201,
+    description="Generate a new layer from a file that was previously uploaded using the file-upload endpoint.",
+    dependencies=[Depends(auth_z)],
+)
+async def create_layer_feature_standard(
+    background_tasks: BackgroundTasks,
+    async_session: AsyncSession = Depends(get_db),
+    user_id: UUID = Depends(get_user_id),
+    project_id: Optional[UUID] = Query(
+        None,
+        description="The ID of the project to add the layer to",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    ),
+    layer_in: ILayerFromDatasetCreate = Body(
+        ...,
+        examples=layer_request_examples["create"][LayerType.feature],
+        description="Layer to create",
+    ),
+):
+    """Create a new feature standard layer from a previously uploaded dataset."""
+
+    return await _create_layer_from_dataset(
+        background_tasks=background_tasks,
+        async_session=async_session,
+        user_id=user_id,
+        project_id=project_id,
+        layer_in=layer_in,
+    )
+
+
+@router.post(
+    "/raster",
+    summary="Create a new raster layer",
+    response_model=IRasterRead,
+    status_code=201,
+    description="Generate a new layer based on a URL for a raster service hosted externally.",
+    dependencies=[Depends(auth_z)],
+)
+async def create_layer_raster(
+    async_session: AsyncSession = Depends(get_db),
+    user_id: UUID4 = Depends(get_user_id),
+    layer_in: IRasterCreate = Body(
+        ...,
+        examples=layer_request_examples["create"][LayerType.raster],
+        description="Layer to create",
+    ),
+):
+    """Create a new raster layer from a service hosted externally."""
+
+    layer_in = Layer(**layer_in.dict(), user_id=user_id)
+    layer = await crud_layer.create(db=async_session, obj_in=layer_in)
+    return layer
+
+
+@router.post(
+    "/table",
+    summary="Create a new table layer",
+    response_class=JSONResponse,
+    status_code=201,
+    description="Generate a new layer from a file that was previously uploaded using the file-upload endpoint.",
+    dependencies=[Depends(auth_z)],
+)
+async def create_layer_table(
+    background_tasks: BackgroundTasks,
+    async_session: AsyncSession = Depends(get_db),
+    user_id: UUID = Depends(get_user_id),
+    project_id: Optional[UUID] = Query(
+        None,
+        description="The ID of the project to add the layer to",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    ),
+    layer_in: ILayerFromDatasetCreate = Body(
+        ...,
+        examples=layer_request_examples["create"][LayerType.table],
+        description="Layer to create",
+    ),
+):
+    """Create a new table layer from a previously uploaded dataset."""
+
+    return await _create_layer_from_dataset(
+        background_tasks=background_tasks,
+        async_session=async_session,
+        user_id=user_id,
+        project_id=project_id,
+        layer_in=layer_in,
+    )
+
+
+@router.post(
+    "/{layer_id}/export",
     summary="Export a layer to a file",
     response_class=FileResponse,
     status_code=201,
     description="Export a layer to a zip file.",
+    dependencies=[Depends(auth_z)],
 )
 async def export_layer(
     async_session: AsyncSession = Depends(get_db),
@@ -197,9 +334,9 @@ async def export_layer(
         description="The ID of the layer to export",
         example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
     ),
-    layer_in: IInternalLayerExport = Body(
+    layer_in: ILayerExport = Body(
         ...,
-        examples=layer_request_examples["export_internal"],
+        examples=layer_request_examples["export"],
         description="Layer to export",
     ),
 ):
@@ -216,35 +353,13 @@ async def export_layer(
     return FileResponse(zip_file_path, media_type="application/zip", filename=file_name)
 
 
-@router.post(
-    "/external",
-    summary="Create a new external layer",
-    response_model=ILayerRead,
-    status_code=201,
-    description="Generate a new layer based on a URL that is stored on an external server.",
-)
-async def create_layer_external(
-    async_session: AsyncSession = Depends(get_db),
-    user_id: UUID4 = Depends(get_user_id),
-    layer_in: ILayerExternalCreate = Body(
-        ...,
-        examples=layer_request_examples["create_external"],
-        description="Layer to create",
-    ),
-):
-    """Create a new external layer."""
-
-    layer_in = Layer(**layer_in.dict(), user_id=user_id)
-    layer = await crud_layer.create(db=async_session, obj_in=layer_in)
-    return layer
-
-
 @router.get(
     "/{layer_id}",
     summary="Retrieve a layer by its ID",
     response_model=ILayerRead,
     response_model_exclude_none=True,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def read_layer(
     async_session: AsyncSession = Depends(get_db),
@@ -261,36 +376,12 @@ async def read_layer(
 
 
 @router.post(
-    "/get-by-ids",
-    summary="Retrieve a list of layers by their IDs",
-    response_model=Page[ILayerRead],
-    response_model_exclude_none=True,
-    status_code=200,
-)
-async def read_layers_by_ids(
-    async_session: AsyncSession = Depends(get_db),
-    page_params: PaginationParams = Depends(),
-    ids: ContentIdList = Body(
-        ...,
-        example=layer_request_examples["get"],
-        description="List of layer IDs to retrieve",
-    ),
-):
-    return await read_contents_by_ids(
-        async_session=async_session,
-        ids=ids,
-        model=Layer,
-        crud_content=crud_layer,
-        page_params=page_params,
-    )
-
-
-@router.post(
     "",
     response_model=Page[ILayerRead],
     response_model_exclude_none=True,
     status_code=200,
     summary="Retrieve a list of layers using different filters including a spatial filter. If not filter is specified, all layers will be returned.",
+    dependencies=[Depends(auth_z)],
 )
 async def read_layers(
     async_session: AsyncSession = Depends(get_db),
@@ -300,6 +391,16 @@ async def read_layers(
         None,
         examples={},
         description="Layer to get",
+    ),
+    team_id: UUID | None = Query(
+        None,
+        description="The ID of the team to get the layers from",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    ),
+    organization_id: UUID | None = Query(
+        None,
+        description="The ID of the organization to get the layers from",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
     ),
     order_by: str = Query(
         None,
@@ -315,6 +416,10 @@ async def read_layers(
     """This endpoints returns a list of layers based one the specified filters."""
 
     with HTTPErrorHandler():
+        # Make sure that team_id and organization_id are not both set
+        if team_id is not None and organization_id is not None:
+            raise ValueError("Only one of team_id and organization_id can be set.")
+
         # Get layers from CRUD
         layers = await crud_layer.get_layers_with_filter(
             async_session=async_session,
@@ -323,6 +428,8 @@ async def read_layers(
             order_by=order_by,
             order=order,
             page_params=page_params,
+            team_id=team_id,
+            organization_id=organization_id,
         )
     return layers
 
@@ -333,6 +440,7 @@ async def read_layers(
     response_model_exclude_none=True,
     status_code=200,
     summary="Retrieve a list of layers using different filters including a spatial filter. If not filter is specified, all layers will be returned.",
+    dependencies=[Depends(auth_z)],
 )
 async def read_catalog_layers(
     async_session: AsyncSession = Depends(get_db),
@@ -374,6 +482,7 @@ async def read_catalog_layers(
     response_model=ILayerRead,
     response_model_exclude_none=True,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def update_layer(
     async_session: AsyncSession = Depends(get_db),
@@ -394,11 +503,80 @@ async def update_layer(
         )
 
 
+@router.put(
+    "/{layer_id}/dataset",
+    response_class=JSONResponse,
+    status_code=200,
+    dependencies=[Depends(auth_z)],
+)
+async def update_layer_dataset(
+    background_tasks: BackgroundTasks,
+    async_session: AsyncSession = Depends(get_db),
+    user_id: UUID = Depends(get_user_id),
+    layer_id: UUID4 = Path(
+        ...,
+        description="The ID of the layer to get",
+        example="3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    ),
+    dataset_id: UUID = Query(
+        ..., description="The ID of the dataset to update the layer with"
+    ),
+):
+    """Update the dataset of a layer."""
+
+    # Ensure updating the dataset of this layer is permitted
+    with HTTPErrorHandler():
+        existing_layer = await crud_layer.get_internal(
+            async_session=async_session,
+            id=layer_id,
+        )
+        if str(existing_layer.user_id) != str(user_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have permission to update this layer.",
+            )
+
+        # Validate and fetch dataset file metadata
+        file_metadata = _validate_and_fetch_metadata(
+            user_id=user_id,
+            dataset_id=dataset_id,
+        )
+
+    # Create job and check if user can create a new job
+    job = await crud_job.check_and_create(
+        async_session=async_session,
+        user_id=user_id,
+        job_type=JobType.update_layer_dataset,
+    )
+
+    # Run the import
+    layer_in = ILayerFromDatasetCreate(
+        name=existing_layer.name,
+        description=existing_layer.description,
+        folder_id=existing_layer.folder_id,
+        properties=existing_layer.properties,
+        dataset_id=dataset_id,
+    )
+    await CRUDLayerDatasetUpdate(
+        background_tasks=background_tasks,
+        async_session=async_session,
+        user_id=user_id,
+        job_id=job.id,
+    ).update(
+        existing_layer_id=existing_layer.id,
+        file_metadata=file_metadata,
+        layer_in=layer_in,
+    )
+
+    return {"job_id": job.id}
+
+
 @router.delete(
     "/{layer_id}",
     response_model=None,
     summary="Delete a layer and its data in case of an internal layer.",
     status_code=204,
+    dependencies=[Depends(auth_z)],
 )
 async def delete_layer(
     async_session: AsyncSession = Depends(get_db),
@@ -423,6 +601,7 @@ async def delete_layer(
     summary="Get feature count",
     response_class=JSONResponse,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def get_feature_count(
     async_session: AsyncSession = Depends(get_db),
@@ -463,6 +642,7 @@ async def get_feature_count(
     summary="Get area statistics of a layer",
     response_class=JSONResponse,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def get_area_statistics(
     async_session: AsyncSession = Depends(get_db),
@@ -501,6 +681,7 @@ async def get_area_statistics(
     summary="Get unique values of a column",
     response_model=Page[IUniqueValue],
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def get_unique_values(
     async_session: AsyncSession = Depends(get_db),
@@ -547,6 +728,7 @@ async def get_unique_values(
     summary="Get statistics of a column",
     response_class=JSONResponse,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def class_breaks(
     async_session: AsyncSession = Depends(get_db),
@@ -603,6 +785,7 @@ async def class_breaks(
     summary="Return the count of layers for different metadata values acting as filters",
     response_model=IMetadataAggregateRead,
     status_code=200,
+    dependencies=[Depends(auth_z)],
 )
 async def metadata_aggregate(
     async_session: AsyncSession = Depends(get_db),

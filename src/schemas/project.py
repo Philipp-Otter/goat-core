@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, HttpUrl, validator
@@ -8,12 +9,11 @@ from src.db.models._base_class import DateTimeBase
 from src.db.models.layer import ContentBaseAttributes, internal_layer_table_name
 from src.schemas.common import CQLQuery
 from src.schemas.layer import (
-    IExternalImageryRead,
-    IExternalVectorTileRead,
+    ExternalServiceOtherProperties,
     IFeatureStandardRead,
     IFeatureToolRead,
+    IRasterRead,
     ITableRead,
-    LayerOtherProperties,
 )
 from src.utils import build_where, optional
 
@@ -23,7 +23,6 @@ from src.utils import build_where, optional
 ################################################################################
 class ProjectContentType(str, Enum):
     layer = "layer"
-    report = "report"
 
 
 class InitialViewState(BaseModel):
@@ -72,6 +71,8 @@ class IProjectRead(ContentBaseAttributes, DateTimeBase):
     layer_order: list[int] | None = Field(None, description="Layer order in project")
     thumbnail_url: HttpUrl | None = Field(description="Project thumbnail URL")
     active_scenario_id: UUID | None = Field(None, description="Active scenario ID")
+    shared_with: dict | None = Field(None, description="Shared with")
+    owned_by: dict | None = Field(None, description="Owned by")
 
 
 @optional
@@ -143,18 +144,22 @@ class IFeatureToolProjectRead(
 ):
     pass
 
+
 class IFeatureStreetNetworkProjectRead(
     LayerProjectIds, IFeatureStandardRead, IFeatureBaseProjectRead
 ):
     pass
 
+
 @optional
 class IFeatureStandardProjectUpdate(IFeatureBaseProject):
     pass
 
+
 @optional
 class IFeatureStreetNetworkProjectUpdate(IFeatureBaseProject):
     pass
+
 
 @optional
 class IFeatureToolProjectUpdate(IFeatureBaseProject):
@@ -188,45 +193,23 @@ class ITableProjectUpdate(CQLQuery):
     group: str | None = Field(None, description="Layer group name", max_length=255)
 
 
-class IExternalVectorTileProjectRead(LayerProjectIds, IExternalVectorTileRead):
+class IRasterProjectRead(LayerProjectIds, IRasterRead):
     group: str = Field(None, description="Layer group name", max_length=255)
-    properties: dict = Field(
-        ...,
+    properties: Optional[dict] = Field(
+        None,
         description="Layer properties",
     )
 
 
 @optional
-class IExternalVectorTileProjectUpdate(BaseModel):
+class IRasterProjectUpdate(BaseModel):
     name: str | None = Field(None, description="Layer name", max_length=255)
     group: str | None = Field(None, description="Layer group name", max_length=255)
     properties: dict | None = Field(
         None,
         description="Layer properties",
     )
-
-
-class IExternalImageryProjectRead(LayerProjectIds, IExternalImageryRead):
-    group: str = Field(None, description="Layer group name", max_length=255)
-    properties: dict = Field(
-        ...,
-        description="Layer properties",
-    )
-    other_properties: LayerOtherProperties = Field(
-        ...,
-        description="Other properties of the layer",
-    )
-
-
-@optional
-class IExternalImageryProjectUpdate(BaseModel):
-    name: str | None = Field(None, description="Layer name", max_length=255)
-    group: str | None = Field(None, description="Layer group name", max_length=255)
-    properties: dict | None = Field(
-        None,
-        description="Layer properties",
-    )
-    other_properties: LayerOtherProperties | None = Field(
+    other_properties: ExternalServiceOtherProperties | None = Field(
         None,
         description="Other properties of the layer",
     )
@@ -236,20 +219,19 @@ layer_type_mapping_read = {
     "feature_standard": IFeatureStandardProjectRead,
     "feature_tool": IFeatureToolProjectRead,
     "feature_street_network": IFeatureStreetNetworkProjectRead,
+    "raster": IRasterProjectRead,
     "table": ITableProjectRead,
-    "external_vector_tile": IExternalVectorTileProjectRead,
-    "external_imagery": IExternalImageryProjectRead,
 }
 
 layer_type_mapping_update = {
     "feature_standard": IFeatureStandardProjectUpdate,
     "feature_tool": IFeatureToolProjectUpdate,
     "feature_street_network": IFeatureStreetNetworkProjectUpdate,
+    "raster": IRasterProjectUpdate,
     "table": ITableProjectUpdate,
-    "external_vector_tile": IExternalVectorTileProjectUpdate,
-    "external_imagery": IExternalImageryProjectUpdate,
 }
 
+# TODO: Refactor
 request_examples = {
     "get": {
         "ids": [
@@ -314,7 +296,7 @@ request_examples = {
                 "group": "Group 1",
             },
         },
-        "external_vector_tile": {
+        "external_vector": {
             "summary": "VectorVectorTile Layer",
             "value": {
                 "name": "VectorVectorTile Layer",

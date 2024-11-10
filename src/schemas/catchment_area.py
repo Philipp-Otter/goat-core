@@ -11,6 +11,7 @@ from src.schemas.toolbox_base import (
     DefaultResultLayerName,
     PTTimeWindow,
     check_starting_points,
+    input_layer_type_line,
     input_layer_type_point,
 )
 
@@ -206,7 +207,7 @@ class CatchmentAreaTravelDistanceCostMotorizedMobility(BaseModel):
 """Catchment area decay function schemas."""
 
 
-class CatchmentAreaDecayFunctionTypePT(Enum):
+class CatchmentAreaDecayFunctionTypePT(str, Enum):
     LOGISTIC = "logistic"
     LINEAR = "linear"
     EXPONENTIAL = "exponential"
@@ -249,6 +250,19 @@ class CatchmentAreaTypeCar(str, Enum):
     rectangular_grid = "rectangular_grid"
 
 
+class CatchmentAreaStreetNetwork(BaseModel):
+    edge_layer_project_id: int = Field(
+        ...,
+        title="Edge Layer Project ID",
+        description="The layer project ID of the street network edge layer.",
+    )
+    node_layer_project_id: int = Field(
+        None,
+        title="Node Layer Project ID",
+        description="The layer project ID of the street network node layer.",
+    )
+
+
 """User-configured catchment area payload schemas."""
 
 
@@ -277,6 +291,11 @@ class ICatchmentAreaActiveMobility(BaseModel):
         None,
         title="Scenario ID",
         description="The ID of the scenario that is to be applied on the input layer or base network.",
+    )
+    street_network: Optional[CatchmentAreaStreetNetwork] = Field(
+        None,
+        title="Street Network Layer Config",
+        description="The configuration of the street network layers to use.",
     )
     catchment_area_type: CatchmentAreaTypeActiveMobility = Field(
         ...,
@@ -328,7 +347,11 @@ class ICatchmentAreaActiveMobility(BaseModel):
 
     @property
     def input_layer_types(self):
-        return {"layer_project_id": input_layer_type_point}
+        return {
+            "layer_project_id": input_layer_type_point,
+            "edge_layer_project_id": input_layer_type_line,
+            "node_layer_project_id": input_layer_type_point,
+        }
 
     @property
     def properties_base(self):
@@ -470,6 +493,11 @@ class ICatchmentAreaCar(BaseModel):
         title="Scenario ID",
         description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
+    street_network: Optional[CatchmentAreaStreetNetwork] = Field(
+        None,
+        title="Street Network Layer Config",
+        description="The configuration of the street network layers to use.",
+    )
     catchment_area_type: CatchmentAreaTypeCar = Field(
         ...,
         title="Return Type",
@@ -518,7 +546,11 @@ class ICatchmentAreaCar(BaseModel):
 
     @property
     def input_layer_types(self):
-        return {"layer_project_id": input_layer_type_point}
+        return {
+            "layer_project_id": input_layer_type_point,
+            "edge_layer_project_id": input_layer_type_line,
+            "node_layer_project_id": input_layer_type_point,
+        }
 
     @property
     def properties_base(self):
@@ -556,6 +588,11 @@ class CatchmentAreaNearbyStationAccess(BaseModel):
         None,
         title="Scenario ID",
         description="The ID of the scenario that is to be applied on the input layer or base network.",
+    )
+    street_network: Optional[CatchmentAreaStreetNetwork] = Field(
+        None,
+        title="Street Network Layer Config",
+        description="The configuration of the street network layers to use.",
     )
     catchment_area_type: CatchmentAreaTypeActiveMobility = Field(
         ...,
@@ -605,7 +642,11 @@ class CatchmentAreaNearbyStationAccess(BaseModel):
 
     @property
     def input_layer_types(self):
-        return {"layer_project_id": input_layer_type_point}
+        return {
+            "layer_project_id": input_layer_type_point,
+            "edge_layer_project_id": input_layer_type_line,
+            "node_layer_project_id": input_layer_type_point,
+        }
 
     @property
     def properties_base(self):

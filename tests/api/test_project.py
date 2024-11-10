@@ -36,6 +36,21 @@ async def test_get_projects(
 
 
 @pytest.mark.asyncio
+async def test_get_shared_projects(
+    client: AsyncClient,
+    fixture_create_shared_team_projects,
+):
+    team_id = str(fixture_create_shared_team_projects["teams"][0].id)
+    response = await client.get(
+        f"{settings.API_V2_STR}/project?team_id={team_id}",
+    )
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == len(
+        fixture_create_shared_team_projects["projects"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_project_wrong_id(client: AsyncClient, fixture_create_project):
     await get_with_wrong_id(client, "project")
 
@@ -263,7 +278,7 @@ async def test_delete_layer_project(client: AsyncClient, fixture_create_layer_pr
         f"{settings.API_V2_STR}/project/{project_id}/layer",
     )
     assert response.status_code == 200
-    assert len(response.json()) == 1
+    assert len(response.json()) == 2
     assert (
         response.json()[0]["id"]
         == fixture_create_layer_project["layer_project"][1]["id"]

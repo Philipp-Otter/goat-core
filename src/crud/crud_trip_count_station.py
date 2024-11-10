@@ -12,7 +12,7 @@ from src.schemas.trip_count_station import (
     ITripCountStation,
     public_transport_types,
 )
-from src.utils import build_where_clause
+from src.utils import build_where_clause, format_value_null_sql
 
 
 class CRUDTripCountStation(CRUDToolBase):
@@ -32,9 +32,6 @@ class CRUDTripCountStation(CRUDToolBase):
 
         input_table = layer_project.table_name
         where_query = build_where_clause([layer_project.where_query])
-        scenario_id = (
-            "NULL" if params.scenario_id is None else f"'{str(params.scenario_id)}'"
-        )
 
         # Create result layer object
         pt_modes = list(public_transport_types.keys())
@@ -72,11 +69,11 @@ class CRUDTripCountStation(CRUDToolBase):
             (summarized ->> 'rail')::integer AS rail, (summarized ->> 'other')::integer AS other,
             (summarized ->> 'bus')::integer + (summarized ->> 'tram')::integer + (summarized ->> 'metro')::integer +
             (summarized ->> 'rail')::integer + (summarized ->> 'other')::integer AS total
-            FROM temporal.count_public_transport_services_station(
+            FROM basic.count_public_transport_services_station(
                 '{input_table}',
                 {layer_project.id},
                 '{settings.CUSTOMER_SCHEMA}',
-                {scenario_id},
+                {format_value_null_sql(params.scenario_id)},
                 :where_query,
                 '{str(timedelta(seconds=params.time_window.from_time))}',
                 '{str(timedelta(seconds=params.time_window.to_time))}',

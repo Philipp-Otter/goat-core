@@ -6,7 +6,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 # Third party imports
-from fastapi import HTTPException, UploadFile, status
+from fastapi import HTTPException, status
 from fastapi_pagination import Page
 from fastapi_pagination import Params as PaginationParams
 from geoalchemy2.shape import WKTElement
@@ -14,9 +14,11 @@ from pydantic import BaseModel
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import SQLModel
+from starlette.datastructures import UploadFile
 
 # Local application imports
 from src.core.config import settings
+from src.core.content import build_shared_with_object, create_query_shared_content
 from src.core.job import CRUDFailedJob, job_init, job_log, run_background_or_immediately
 from src.core.layer import (
     CRUDLayerBase,
@@ -27,7 +29,14 @@ from src.core.layer import (
 )
 from src.crud.base import CRUDBase
 from src.crud.crud_layer_project import layer_project as crud_layer_project
-from src.db.models.layer import Layer
+from src.db.models import (
+    Layer,
+    LayerOrganizationLink,
+    LayerTeamLink,
+    Organization,
+    Role,
+    Team,
+)
 from src.schemas.error import (
     ColumnNotFoundError,
     LayerNotFoundError,
@@ -41,9 +50,10 @@ from src.schemas.layer import (
     FeatureType,
     ICatalogLayerGet,
     IFeatureStandardCreateAdditionalAttributes,
+    IFileUploadExternalService,
     IFileUploadMetadata,
-    IInternalLayerCreate,
-    IInternalLayerExport,
+    ILayerExport,
+    ILayerFromDatasetCreate,
     ILayerGet,
     IMetadataAggregate,
     IMetadataAggregateRead,
@@ -143,7 +153,7 @@ class CRUDLayer(CRUDLayerBase):
         if layer is None:
             raise LayerNotFoundError(f"{Layer.__name__} not found")
 
-        # Check if internal or external layer
+        # Delete data if internal layer
         if layer.type in [LayerType.table.value, LayerType.feature.value]:
             # Delete layer data
             await delete_layer_data(async_session=async_session, layer=layer)
@@ -169,10 +179,10 @@ class CRUDLayer(CRUDLayerBase):
         self,
         async_session: AsyncSession,
         user_id: UUID,
+        source: UploadFile | IFileUploadExternalService,
         layer_type: LayerType,
-        file: UploadFile,
     ):
-        """Validate file using ogr2ogr."""
+        """Fetch data if required, then validate using ogr2ogr."""
 
         dataset_id = uuid4()
         # Initialize OGRFileUpload
@@ -180,18 +190,18 @@ class CRUDLayer(CRUDLayerBase):
             async_session=async_session,
             user_id=user_id,
             dataset_id=dataset_id,
-            file=file,
+            source=source,
         )
 
         # Save file
         timeout = 120
         try:
             file_path = await asyncio.wait_for(
-                file_upload.save_file(file=file),
+                file_upload.save_file(),
                 timeout,
             )
         except asyncio.TimeoutError:
-            # Handle the timeout here. For example, you can raise a custom exception or log it.
+            # Run failure function and perform cleanup
             await file_upload.save_file_fail()
             raise HTTPException(
                 status_code=status.HTTP_408_REQUEST_TIMEOUT,
@@ -240,16 +250,21 @@ class CRUDLayer(CRUDLayerBase):
             )
 
         # Get file size in bytes
-        original_position = file.file.tell()
-        file.file.seek(0, 2)
-        file_size = file.file.tell()
-        file.file.seek(original_position)
+        if isinstance(source, UploadFile):
+            original_position = source.file.tell()
+            source.file.seek(0, 2)
+            file_size = source.file.tell()
+            source.file.seek(original_position)
+        else:
+            file_size = os.path.getsize(file_path)
 
         # Define metadata object
         metadata = IFileUploadMetadata(
             **validation_result,
             dataset_id=dataset_id,
-            file_ending=os.path.splitext(file.filename)[-1][1:],
+            file_ending=os.path.splitext(
+                source.filename if isinstance(source, UploadFile) else file_path
+            )[-1][1:],
             file_size=file_size,
             layer_type=layer_type,
         )
@@ -517,6 +532,8 @@ class CRUDLayer(CRUDLayerBase):
         user_id: UUID,
         params: ILayerGet | ICatalogLayerGet,
         attributes_to_exclude: list = [],
+        team_id: UUID = None,
+        organization_id: UUID = None,
     ):
         """Get filter for get layer queries."""
         filters = []
@@ -531,22 +548,34 @@ class CRUDLayer(CRUDLayerBase):
                 )
                 and value is not None
             ):
+                # Avoid adding folder_id in case team_id or organization_id is provided
+                if key == "folder_id" and (team_id or organization_id):
+                    continue
+
                 # Convert value to list if not list
                 if not isinstance(value, list):
                     value = [value]
                 filters.append(getattr(Layer, key).in_(value))
 
-        # Check if ILayer get then it is for user owned layers
+        # Check if ILayer get then it is organization layers
         if isinstance(params, ILayerGet):
             if params.in_catalog is not None:
-                filters.append(
-                    and_(
-                        Layer.in_catalog == bool(params.in_catalog),
-                        Layer.user_id == user_id,
+                if not team_id and not organization_id:
+                    filters.append(
+                        and_(
+                            Layer.in_catalog == bool(params.in_catalog),
+                            Layer.user_id == user_id,
+                        )
                     )
-                )
+                else:
+                    filters.append(
+                        and_(
+                            Layer.in_catalog == bool(params.in_catalog),
+                        )
+                    )
             else:
-                filters.append(Layer.user_id == user_id)
+                if not team_id and not organization_id:
+                    filters.append(Layer.user_id == user_id)
         else:
             filters.append(Layer.in_catalog == bool(True))
 
@@ -575,6 +604,8 @@ class CRUDLayer(CRUDLayerBase):
         order: str,
         page_params: PaginationParams,
         params: ILayerGet | ICatalogLayerGet,
+        team_id: UUID = None,
+        organization_id: UUID = None,
     ):
         """Get layer with filter."""
 
@@ -590,10 +621,31 @@ class CRUDLayer(CRUDLayerBase):
                 detail="Feature layer type can only be set when layer type is feature",
             )
         # Get base filter
-        filters = await self.get_base_filter(user_id=user_id, params=params)
+        filters = await self.get_base_filter(
+            user_id=user_id,
+            params=params,
+            team_id=team_id,
+            organization_id=organization_id,
+        )
+
+        # Get roles
+        roles = await CRUDBase(Role).get_all(
+            async_session,
+        )
+        role_mapping = {role.id: role.name for role in roles}
 
         # Build query
-        query = select(Layer).where(and_(*filters))
+        query = create_query_shared_content(
+            Layer,
+            LayerTeamLink,
+            LayerOrganizationLink,
+            Team,
+            Organization,
+            Role,
+            filters,
+            team_id=team_id,
+            organization_id=organization_id,
+        )
 
         # Build params
         params = {
@@ -610,6 +662,16 @@ class CRUDLayer(CRUDLayerBase):
             page_params=page_params,
             **params,
         )
+        layers_arr = build_shared_with_object(
+            items=layers.items,
+            role_mapping=role_mapping,
+            team_key="team_links",
+            org_key="organization_links",
+            model_name="layer",
+            team_id=team_id,
+            organization_id=organization_id,
+        )
+        layers.items = layers_arr
         return layers
 
     async def metadata_aggregate(
@@ -667,10 +729,9 @@ class CRUDLayerImport(CRUDFailedJob):
             f'{settings.USER_DATA_SCHEMA}."{str(self.job_id).replace("-", "")}"'
         )
 
-    @job_log(job_step_name="internal_layer_create")
     async def create_internal(
         self,
-        layer_in: IInternalLayerCreate,
+        layer_in: ILayerFromDatasetCreate,
         file_metadata: dict,
         attribute_mapping: dict,
         project_id: UUID = None,
@@ -688,9 +749,8 @@ class CRUDLayerImport(CRUDFailedJob):
             geom_type = SupportedOgrGeomType[
                 file_metadata["data_types"]["geometry"]["type"]
             ].value
-            additional_attributes["properties"] = get_base_style(
-                feature_geometry_type=geom_type
-            )
+            if not layer_in.properties:
+                layer_in.properties = get_base_style(feature_geometry_type=geom_type)
             additional_attributes["type"] = LayerType.feature
             additional_attributes["feature_layer_type"] = FeatureType.standard
             additional_attributes["feature_layer_geometry_type"] = geom_type
@@ -745,17 +805,12 @@ class CRUDLayerImport(CRUDFailedJob):
                 project_id=project_id,
             )
 
-        return {
-            "msg": "Layer successfully created.",
-            "status": JobStatusType.finished.value,
-        }
+        return layer.id
 
-    @run_background_or_immediately(settings)
-    @job_init()
     async def import_file(
         self,
         file_metadata: dict,
-        layer_in: IInternalLayerCreate,
+        layer_in: ILayerFromDatasetCreate,
         project_id: UUID = None,
     ):
         """Import file using ogr2ogr."""
@@ -791,13 +846,30 @@ class CRUDLayerImport(CRUDFailedJob):
             job_id=self.job_id,
         )
         # Create layer metadata and thumbnail
-        result = await self.create_internal(
+        layer_id = await self.create_internal(
             layer_in=layer_in,
             file_metadata=file_metadata,
             attribute_mapping=attribute_mapping,
             project_id=project_id,
         )
 
+        return result, layer_id
+
+    @run_background_or_immediately(settings)
+    @job_init()
+    async def import_file_job(
+        self,
+        file_metadata: dict,
+        layer_in: ILayerFromDatasetCreate,
+        project_id: UUID = None,
+    ):
+        """Create a layer from a dataset file."""
+
+        result, _ = await self.import_file(
+            file_metadata=file_metadata,
+            layer_in=layer_in,
+            project_id=project_id,
+        )
         return result
 
 
@@ -812,7 +884,7 @@ class CRUDLayerExport:
             settings.DATA_DIR, str(self.user_id), str(self.id)
         )
 
-    async def create_metadata_file(self, layer: Layer, layer_in: IInternalLayerExport):
+    async def create_metadata_file(self, layer: Layer, layer_in: ILayerExport):
         last_data_updated_at = await CRUDLayer(Layer).get_last_data_updated_at(
             async_session=self.async_session, id=self.id, query=layer_in.query
         )
@@ -824,9 +896,7 @@ class CRUDLayerExport:
             f.write("############################################################\n")
             f.write(f"Metadata for layer {layer.name}\n")
             f.write("############################################################\n")
-            f.write(
-                f"Exported Coordinate Reference System: {layer_in.crs}\n"
-            )
+            f.write(f"Exported Coordinate Reference System: {layer_in.crs}\n")
             f.write(
                 f"Exported File Type: {OgrDriverType[layer_in.file_type.value].value}\n"
             )
@@ -859,7 +929,7 @@ class CRUDLayerExport:
 
     async def export_file(
         self,
-        layer_in: IInternalLayerExport,
+        layer_in: ILayerExport,
     ):
         """Export file using ogr2ogr."""
 
@@ -867,6 +937,12 @@ class CRUDLayerExport:
         layer = await CRUDLayer(Layer).get_internal(
             async_session=self.async_session, id=self.id
         )
+
+        # Only feature and table layers can be exported
+        if layer.type not in [LayerType.feature, LayerType.table]:
+            raise UnsupportedLayerTypeError(
+                "Layer is not a feature layer or table layer. Other layer types cannot be exported."
+            )
 
         # Make sure that feature layer have CRS set
         if layer.type == LayerType.feature:
@@ -879,7 +955,7 @@ class CRUDLayerExport:
         # Build select query based on attribute mapping
         select_query = ""
         for key, value in layer.attribute_mapping.items():
-            select_query += f"{key} AS {value}, "
+            select_query += f"{key} AS \"{value}\", "
 
         # Add id and geom
         if layer.type == LayerType.feature:
@@ -938,7 +1014,7 @@ class CRUDLayerExport:
 
         return result_dir
 
-    async def export_file_run(self, layer_in: IInternalLayerExport):
+    async def export_file_run(self, layer_in: ILayerExport):
         return await self.export_file(layer_in=layer_in)
 
 
@@ -969,3 +1045,52 @@ class CRUDDataDelete(CRUDFailedJob):
         layers: list[Layer],
     ):
         return await self.delete_multi(async_session=async_session, layers=layers)
+
+
+class CRUDLayerDatasetUpdate(CRUDFailedJob):
+    """CRUD class for updating the dataset of an existing layer and updating all layer project references."""
+
+    def __init__(self, job_id, background_tasks, async_session, user_id):
+        super().__init__(job_id, background_tasks, async_session, user_id)
+
+    @run_background_or_immediately(settings)
+    @job_init()
+    async def update(
+        self,
+        existing_layer_id: UUID,
+        file_metadata: dict,
+        layer_in: ILayerFromDatasetCreate,
+    ):
+        """Update layer dataset."""
+
+        original_name = layer_in.name
+
+        # Create a new layer with the updated dataset while transferring existing layer properties
+        result, layer_id = await CRUDLayerImport(
+            background_tasks=self.background_tasks,
+            async_session=self.async_session,
+            user_id=self.user_id,
+            job_id=self.job_id,
+        ).import_file(
+            file_metadata=file_metadata,
+            layer_in=layer_in,
+        )
+
+        # Update all layer project references with the new layer id
+        await crud_layer_project.update_layer_id(
+            async_session=self.async_session,
+            layer_id=existing_layer_id,
+            new_layer_id=layer_id,
+        )
+
+        # Delete the old layer
+        await layer.delete(async_session=self.async_session, id=existing_layer_id)
+
+        # Rename the new layer
+        await layer.update(
+            async_session=self.async_session,
+            id=layer_id,
+            layer_in={"name": original_name},
+        )
+
+        return result

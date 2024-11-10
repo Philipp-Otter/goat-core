@@ -5,24 +5,29 @@ import os
 import re
 import time
 import zipfile
+from enum import Enum
 from typing import Union
 from uuid import UUID
-from enum import Enum
-from datetime import datetime
 
 # Third party imports
 import aiofiles
 import aiofiles.os as aos
 import pandas as pd
-from fastapi import UploadFile
+from fastapi import HTTPException, status
 from openpyxl import load_workbook
 from osgeo import ogr, osr
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from pyproj import CRS
+from qgis.core import (
+    QgsProject,
+    QgsVectorFileWriter,
+    QgsVectorLayer,
+)
 from shapely import wkb
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import select, text
 from sqlmodel import SQLModel
+from starlette.datastructures import UploadFile
 
 # Local application imports
 from src.core.config import settings
@@ -30,6 +35,7 @@ from src.core.job import job_log
 from src.crud.base import CRUDBase
 from src.db.models._link_model import LayerProjectLink
 from src.db.models.layer import (
+    FeatureDataType,
     FeatureLayerExportType,
     FeatureType,
     FileUploadType,
@@ -40,18 +46,19 @@ from src.db.models.layer import (
 from src.schemas.error import DataOutCRSBoundsError, Ogr2OgrError
 from src.schemas.job import JobStatusType, Msg, MsgType
 from src.schemas.layer import (
+    IFileUploadExternalService,
+    MaxFileSizeType,
     NumberColumnsPerType,
     OgrDriverType,
     OgrPostgresType,
     SupportedOgrGeomType,
-    UserDataTable,
 )
 from src.utils import (
     async_delete_dir,
     async_run_command,
     async_scandir,
+    print_warning,
     sanitize_error_message,
-    table_exists,
 )
 
 
@@ -162,19 +169,72 @@ class FileUpload:
         async_session: AsyncSession,
         user_id: UUID,
         dataset_id: UUID,
-        file: UploadFile,
+        source: UploadFile | IFileUploadExternalService,
     ):
         self.async_session = async_session
         self.user_id = user_id
-        self.file = file
+        self.source = source
         self.folder_path = os.path.join(
             settings.DATA_DIR, str(self.user_id), str(dataset_id)
         )
-        self.file_ending = os.path.splitext(file.filename)[-1][1:]
-        self.file_name = file.filename
-        self.file_path = os.path.join(self.folder_path, "file." + self.file_ending)
 
-    async def save_file(self, file: UploadFile):
+        if isinstance(source, UploadFile):
+            self.file_ending = os.path.splitext(source.filename)[-1][1:]
+            self.file_path = os.path.join(self.folder_path, "file." + self.file_ending)
+        else:
+            self.file_path = os.path.join(
+                self.folder_path, "file." + FileUploadType.geojson.value
+            )
+
+    async def _fetch_and_write(self):
+        """Fetch data from external service if required, save file to disk."""
+
+        if isinstance(self.source, UploadFile):
+            # An existing file was uploaded, save file in chunks
+            async with aiofiles.open(self.file_path, "wb") as buffer:
+                while True:
+                    chunk = await self.source.read(65536)
+                    if not chunk:
+                        break
+                    await buffer.write(chunk)
+        else:
+            # Ensure a URL is specified
+            url = self.source.other_properties.url
+            if not url:
+                raise ValueError(
+                    "A URL must be specified under the 'url' key of other_properties."
+                )
+
+            # Initialize OGR external service fetching
+            fetch_layer_external_service = FetchLayerExternalService(
+                url=url, output_file=self.file_path
+            )
+
+            if self.source.data_type == FeatureDataType.wfs:
+                # Ensure a single WFS layer is specified
+                layers = self.source.other_properties.layers
+                if not layers or len(layers) != 1:
+                    raise ValueError(
+                        "WFS: A single layer must be specified under the 'layers' key of other_properties."
+                    )
+
+                # Fetch the specified layer
+                fetch_layer_external_service.fetch_wfs(layer_name=layers[0])
+
+                # Ensure the newly saved file does not exceed file size limits
+                if (
+                    os.path.getsize(self.file_path)
+                    > MaxFileSizeType[FileUploadType.gpkg.value].value
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File size too large. Max file size is {round(MaxFileSizeType[FileUploadType.gpkg.value].value / 1048576, 2)} MB",
+                    )
+            elif self.data_type == FeatureDataType.mvt:
+                # TODO: Implement MVT fetching
+                pass
+
+    async def save_file(self):
         """Save file to disk for later operations."""
 
         # Clean all old folders that are older then two hours
@@ -186,18 +246,149 @@ class FileUpload:
             await aos.mkdir(os.path.join(settings.DATA_DIR, str(self.user_id)))
         await aos.mkdir(self.folder_path)
 
-        # Save file in chunks
-        async with aiofiles.open(self.file_path, "wb") as buffer:
-            while True:
-                chunk = await file.read(65536)
-                if not chunk:
-                    break
-                await buffer.write(chunk)
+        # Fetch and save file
+        await self._fetch_and_write()
+
         return self.file_path
 
     async def save_file_fail(self):
         """Delete folder if file upload fails."""
         await async_delete_dir(self.folder_path)
+
+
+class FetchLayerExternalService:
+    def __init__(self, url: HttpUrl, output_file: str):
+        self.MAX_FEATURE_COUNT = 100000
+
+        self.url = url
+        self.output_file = output_file
+
+        # Output driver to be used
+        self.output_driver_type = OgrDriverType.geojson.value
+
+    def fetch_wfs(self, layer_name: str):
+        """Fetch data from WFS service and save to disk."""
+
+        # First, attempt to fetch data using QGIS
+        try:
+            # Create vector layer containing features from the WFS source
+            uri = f"typename='{layer_name}' url='{self.url}'"
+            layer = QgsVectorLayer(uri, layer_name, "WFS")
+
+            if not layer.isValid():
+                raise ValueError(f"Unable to open layer: {layer_name}")
+
+            # Ensure layer is not too large
+            feature_count = layer.featureCount()
+            if feature_count > self.MAX_FEATURE_COUNT:
+                raise ValueError(
+                    f"Layer {layer_name} contains too many features ({feature_count})."
+                )
+
+            # Add layer to project and write to GeoJSON file
+            QgsProject.instance().addMapLayer(layer)
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = self.output_driver_type
+            error = QgsVectorFileWriter.writeAsVectorFormatV2(
+                layer,
+                self.output_file,
+                QgsProject.instance().transformContext(),
+                options,
+            )
+            # Remove layer from project
+            QgsProject.instance().removeMapLayer(layer)
+
+            if error[0] != QgsVectorFileWriter.NoError:
+                raise Exception(f"Unable to write GeoJSON file: {error[1]}")
+
+            return
+        except Exception as e:
+            print_warning("QGIS failed to fetch WFS data, falling back to OGR.")
+            print_warning(f"QGIS error: {e}")
+
+        # Second, attempt to fetch data using OGR
+        ogr.UseExceptions()
+
+        # Initialize output GeoJSON driver
+        output_driver = ogr.GetDriverByName(self.output_driver_type)
+        if output_driver is None:
+            raise Exception(f"{self.output_driver_type} driver is not available.")
+
+        # Create output data source
+        self.output_data_source = output_driver.CreateDataSource(self.output_file)
+        if self.output_data_source is None:
+            raise Exception(
+                f"Could not create output data source at {self.output_file}"
+            )
+
+        # Initialize WFS data source
+        wfs_data_source = ogr.Open(f"WFS:{str(self.url)}")
+        if wfs_data_source is None:
+            raise ValueError(f"Could not open WFS service at {self.url}")
+
+        # Get the specified layer
+        input_layer = wfs_data_source.GetLayerByName(layer_name)
+        if input_layer is None:
+            raise ValueError(f"Could not find layer {layer_name} in WFS service.")
+
+        # Ensure layer is not too large
+        feature_count = input_layer.GetFeatureCount()
+        if feature_count > self.MAX_FEATURE_COUNT:
+            raise ValueError(
+                f"Layer {layer_name} contains too many features ({feature_count})."
+            )
+
+        # Get the layer definition
+        input_layer_defn = input_layer.GetLayerDefn()
+        if input_layer_defn is None:
+            raise ValueError(f"Could not get layer definition for {layer_name}.")
+
+        # Process geometry field
+        if input_layer_defn.GetGeomFieldCount() != 1:
+            raise ValueError(
+                f"Layer {layer_name} must contain exactly one geometry field."
+            )
+
+        geom_type = input_layer_defn.GetGeomFieldDefn(0).GetType()
+        if geom_type == ogr.wkbUnknown:
+            first_feature = input_layer.GetNextFeature()
+            if first_feature:
+                geom_type = first_feature.GetGeometryRef().GetGeometryType()
+            else:
+                raise Exception(
+                    "Could not determine geometry type for WFS layer, no features exist."
+                )
+
+        # Initialize output layer
+        output_layer = self.output_data_source.CreateLayer(
+            layer_name,
+            srs=input_layer.GetSpatialRef(),
+            geom_type=geom_type,
+        )
+        if output_layer is None:
+            raise Exception(
+                f"Could not create layer {layer_name} in output data source."
+            )
+
+        # Create all remaining non-geometry columns
+        for i in range(input_layer_defn.GetFieldCount()):
+            field_defn = input_layer_defn.GetFieldDefn(i)
+            output_layer.CreateField(field_defn)
+
+        # Copy features from input to output layer
+        for feature in input_layer:
+            output_layer.CreateFeature(feature)
+
+        # Cleanup
+        self.output_data_source = None
+        wfs_data_source = None
+
+        ogr.DontUseExceptions()
+
+    async def fetch_mvt(self):
+        """Fetch data from MVT service and save to disk."""
+        # TODO: Implement MVT fetching
+        pass
 
 
 class OGRFileHandling:
@@ -306,9 +497,18 @@ class OGRFileHandling:
 
         if layer_def.GetGeomFieldCount() == 1:
             # Get geometry type of layer to upload to specify target table
-            geometry_type = ogr.GeometryTypeToName(layer_def.GetGeomType()).replace(
-                " ", "_"
-            )
+            if layer_def.GetGeomType() != ogr.wkbUnknown:
+                geometry_type = layer_def.GetGeomType()
+            else:
+                first_feature = layer.GetNextFeature()
+                if first_feature:
+                    geometry_type = first_feature.GetGeometryRef().GetGeometryType()
+                else:
+                    raise Exception(
+                        "Could not determine geometry type for layer, no features exist."
+                    )
+            geometry_type = ogr.GeometryTypeToName(geometry_type).replace(" ", "_")
+
             # Strip the "Measured " from beginning of the the geometry type name
             geometry_type = geometry_type.replace("Measured_", "")
             # Strip "Z", "M", "ZM" or "25D" from the end of the geometry type name
@@ -539,13 +739,23 @@ class OGRFileHandling:
         if self.file_ending == FileUploadType.gpkg.value:
             layer_name = layer.GetName()
         else:
-            layer_name = ""
+            layer_name = None
 
         # Build CMD command
-        cmd = f"""ogr2ogr -f "PostgreSQL" "PG:host={settings.POSTGRES_SERVER} dbname={settings.POSTGRES_DB} user={settings.POSTGRES_USER} password={settings.POSTGRES_PASSWORD} port={settings.POSTGRES_PORT}" {self.file_path} {layer_name} -nln {temp_table_name} -t_srs "EPSG:4326" -progress -dim XY {geometry_type} -unsetFieldWidth"""
-        # Run as async task
-        task = asyncio.create_task(async_run_command(cmd))
-        await task
+        cmd = (
+            f'ogr2ogr -f "PostgreSQL" "PG:host={settings.POSTGRES_SERVER} dbname={settings.POSTGRES_DB} '
+            f'user={settings.POSTGRES_USER} password={settings.POSTGRES_PASSWORD} port={settings.POSTGRES_PORT}" '
+            f'"{self.file_path}" '
+        )
+        if layer_name:
+            cmd += f"{layer_name} "
+        cmd += f'-nln {temp_table_name} -t_srs "EPSG:4326" -progress -dim XY {geometry_type} -unsetFieldWidth'
+        try:
+            # Run as async task
+            task = asyncio.create_task(async_run_command(cmd))
+            await task
+        except Exception as e:
+            raise Ogr2OgrError(sanitize_error_message(str(e)))
 
         # Close data source
         data_source = None
@@ -624,13 +834,14 @@ class OGRFileHandling:
             to_crs_flag = ""
 
         # Build CMD command
+        sql_query = sql_query.replace('"', '\\"')
         cmd = f"""ogr2ogr -f "{OgrDriverType[file_type.value].value}" "{self.file_path}" PG:"host={settings.POSTGRES_SERVER} dbname={settings.POSTGRES_DB} user={settings.POSTGRES_USER} password={settings.POSTGRES_PASSWORD} port={settings.POSTGRES_PORT}" -sql "{sql_query}" -nln "{layer.name}" {to_crs_flag} -progress"""
         try:
             # Run as async task
             task = asyncio.create_task(async_run_command(cmd))
             await task
         except Exception as e:
-            raise Ogr2OgrError(sanitize_error_message(e))
+            raise Ogr2OgrError(sanitize_error_message(str(e)))
 
         return self.file_path
 

@@ -5,6 +5,7 @@ from src.core.config import settings
 from src.core.job import job_init, job_log, run_background_or_immediately
 from src.crud.crud_heatmap import CRUDHeatmapBase
 from src.schemas.heatmap import (
+    ROUTING_MODE_DEFAULT_SPEED,
     TRAVELTIME_MATRIX_RESOLUTION,
     TRAVELTIME_MATRIX_TABLE,
     ActiveRoutingHeatmapType,
@@ -15,6 +16,7 @@ from src.schemas.heatmap import (
 from src.schemas.job import JobStatusType
 from src.schemas.layer import FeatureGeometryType, IFeatureLayerToolCreate
 from src.schemas.toolbox_base import DefaultResultLayerName
+from src.utils import format_value_null_sql
 
 
 class CRUDHeatmapClosestAverage(CRUDHeatmapBase):
@@ -33,9 +35,6 @@ class CRUDHeatmapClosestAverage(CRUDHeatmapBase):
         # Create temp table name for points
         temp_points = await self.create_temp_table_name("points")
 
-        # Create formatted scenario ID string for SQL query
-        scenario_id = "NULL" if scenario_id is None else f"'{str(scenario_id)}'"
-
         # Create formatted opportunity geofence layer strings for SQL query
         geofence_table = (
             "NULL"
@@ -51,20 +50,30 @@ class CRUDHeatmapClosestAverage(CRUDHeatmapBase):
 
         append_to_existing = False
         for layer in layers:
+            # Compute geofence buffer distance
+            geofence_buffer_dist = (
+                layer["layer"].max_traveltime
+                * ((ROUTING_MODE_DEFAULT_SPEED[routing_type] * 1000) / 60)
+                if opportunity_geofence_layer is not None
+                else "NULL"
+            )
+
             # Create distributed point table using sql
             await self.async_session.execute(
                 f"""SELECT basic.create_heatmap_closest_average_opportunity_table(
                     {layer["layer"].opportunity_layer_project_id},
                     '{layer["table_name"]}',
                     '{settings.CUSTOMER_SCHEMA}',
-                    {scenario_id},
+                    {format_value_null_sql(scenario_id)},
                     {geofence_table},
                     {geofence_where_filter},
+                    {geofence_buffer_dist},
                     {layer["layer"].max_traveltime},
                     {layer["layer"].number_of_destinations},
                     '{layer["where_query"].replace("'", "''")}',
                     '{temp_points}',
                     {TRAVELTIME_MATRIX_RESOLUTION[routing_type]},
+                    {layer["geom_type"] == FeatureGeometryType.polygon},
                     {append_to_existing}
                 )"""
             )
@@ -86,16 +95,20 @@ class CRUDHeatmapClosestAverage(CRUDHeatmapBase):
         query = f"""
             INSERT INTO {result_table} (layer_id, geom, text_attr1, float_attr1)
             WITH grouped AS (
-                SELECT dest_id.value AS dest_id, (ARRAY_AGG(sub_matrix.traveltime ORDER BY sub_matrix.traveltime))[1:sub_matrix.num_destinations] AS traveltime
+                SELECT dest_id, (ARRAY_AGG(traveltime ORDER BY traveltime))[1:num_destinations] AS traveltime
                 FROM (
-                    SELECT matrix.orig_id, matrix.dest_id, matrix.traveltime, opportunity.num_destinations
-                    FROM {opportunity_table} opportunity, {TRAVELTIME_MATRIX_TABLE[params.routing_type]} matrix
-                    WHERE matrix.h3_3 = opportunity.h3_3
-                    AND matrix.orig_id = opportunity.h3_index
-                    AND matrix.traveltime <= opportunity.max_traveltime
-                ) sub_matrix
-                JOIN LATERAL UNNEST(sub_matrix.dest_id) dest_id(value) ON TRUE
-                GROUP BY dest_id.value, sub_matrix.num_destinations
+                    SELECT opportunity_id, dest_id.value AS dest_id, min(traveltime) AS traveltime, num_destinations
+                    FROM (
+                        SELECT opportunity.id AS opportunity_id, matrix.orig_id, matrix.dest_id, matrix.traveltime, opportunity.num_destinations
+                        FROM {opportunity_table} opportunity, {TRAVELTIME_MATRIX_TABLE[params.routing_type]} matrix
+                        WHERE matrix.h3_3 = opportunity.h3_3
+                        AND matrix.orig_id = opportunity.h3_index
+                        AND matrix.traveltime <= opportunity.max_traveltime
+                    ) sub_matrix
+                    JOIN LATERAL UNNEST(sub_matrix.dest_id) dest_id(value) ON TRUE
+                    GROUP BY opportunity_id, dest_id.value, num_destinations
+                ) grouped_opportunities
+                GROUP BY dest_id, num_destinations
             )
             SELECT '{result_layer_id}', ST_SetSRID(h3_cell_to_boundary(grouped.dest_id)::geometry, 4326), grouped.dest_id,
                 AVG(traveltime.value) AS accessibility

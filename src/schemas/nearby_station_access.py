@@ -1,17 +1,19 @@
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 from src.schemas.catchment_area import (
     CatchmentAreaRoutingModeActiveMobility,
     CatchmentAreaRoutingModePT,
+    CatchmentAreaStreetNetwork,
 )
 from src.schemas.layer import ToolType
 from src.schemas.toolbox_base import (
     CatchmentAreaStartingPointsBase,
     PTTimeWindow,
     check_starting_points,
+    input_layer_type_line,
     input_layer_type_point,
 )
 
@@ -64,6 +66,18 @@ class INearbyStationAccess(BaseModel):
         title="Scenario ID",
         description="The ID of the scenario that is to be applied on the input layer or base network.",
     )
+    street_network: Optional[CatchmentAreaStreetNetwork] = Field(
+        None,
+        title="Street Network Layer Config",
+        description="The configuration of the street network layers to use.",
+    )
+
+    # Ensure at least one mode is selected
+    @validator("mode")
+    def check_mode(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("At least one mode must be selected.")
+        return v
 
     @property
     def tool_type(self):
@@ -71,7 +85,11 @@ class INearbyStationAccess(BaseModel):
 
     @property
     def input_layer_types(self):
-        return {"layer_project_id": input_layer_type_point}
+        return {
+            "layer_project_id": input_layer_type_point,
+            "edge_layer_project_id": input_layer_type_line,
+            "node_layer_project_id": input_layer_type_point,
+        }
 
     @property
     def geofence_table(self):
